@@ -147,6 +147,25 @@ export type DiagnosticToolLoopEvent = DiagnosticBaseEvent & {
   pairedToolName?: string;
 };
 
+export type DiagnosticOptimizationQueryEvent = DiagnosticBaseEvent & {
+  type: "optimization.usage_query";
+  agentId?: string;
+  path: string;
+  latencyMs: number;
+  result: "success" | "error";
+  fallbackReason?: string;
+};
+
+export type DiagnosticOptimizationReconciliationEvent = DiagnosticBaseEvent & {
+  type: "optimization.reconciliation";
+  agentId?: string;
+  sessionsProcessed: number;
+  bytesProcessed: number;
+  durationMs: number;
+  rebuilds: number;
+  error: boolean;
+};
+
 export type DiagnosticEventPayload =
   | DiagnosticUsageEvent
   | DiagnosticWebhookReceivedEvent
@@ -160,7 +179,9 @@ export type DiagnosticEventPayload =
   | DiagnosticLaneDequeueEvent
   | DiagnosticRunAttemptEvent
   | DiagnosticHeartbeatEvent
-  | DiagnosticToolLoopEvent;
+  | DiagnosticToolLoopEvent
+  | DiagnosticOptimizationQueryEvent
+  | DiagnosticOptimizationReconciliationEvent;
 
 export type DiagnosticEventInput = DiagnosticEventPayload extends infer Event
   ? Event extends DiagnosticEventPayload
