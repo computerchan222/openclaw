@@ -11,6 +11,7 @@ import { resolveAgentAvatar } from "../agents/identity-avatar.js";
 import { CANVAS_WS_PATH, handleA2uiHttpRequest } from "../canvas-host/a2ui.js";
 import type { CanvasHostHandler } from "../canvas-host/server.js";
 import { loadConfig } from "../config/config.js";
+import { getOptimizationSnapshot } from "../infra/usage-observability.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { safeEqualSecret } from "../security/secret-equal.js";
 import { handleSlackHttpRequest } from "../slack/http/index.js";
@@ -177,6 +178,34 @@ function handleGatewayProbeRequest(
     return true;
   }
   res.end(JSON.stringify({ ok: true, status }));
+  return true;
+}
+
+function handleOptimizationStatsRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestPath: string,
+): boolean {
+  if (requestPath !== "/diagnostics/optimization-stats") {
+    return false;
+  }
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, HEAD");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Method Not Allowed");
+    return true;
+  }
+  if (method === "HEAD") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.end();
+    return true;
+  }
+  res.setHeader("Cache-Control", "no-store");
+  sendJson(res, 200, getOptimizationSnapshot());
   return true;
 }
 
@@ -687,6 +716,11 @@ export function createGatewayHttpServer(opts: {
             }),
         });
       }
+
+      requestStages.push({
+        name: "optimization-stats",
+        run: () => handleOptimizationStatsRequest(req, res, requestPath),
+      });
 
       requestStages.push({
         name: "gateway-probes",

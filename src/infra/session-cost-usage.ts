@@ -33,6 +33,13 @@ import type {
   SessionUsageTimePoint,
   SessionUsageTimeSeries,
 } from "./session-cost-usage.types.js";
+import {
+  getAggregatedCostUsage,
+  isAnyUsageAggregationReady,
+  isUsageAggregationReady,
+} from "./usage-aggregation.js";
+import type { FallbackReason, QueryPath } from "./usage-observability.js";
+import { recordUsageQuery } from "./usage-observability.js";
 
 export type {
   CostUsageDailyEntry,
@@ -66,6 +73,31 @@ const emptyTotals = (): CostUsageTotals => ({
   cacheWriteCost: 0,
   missingCostEntries: 0,
 });
+
+// --- Per-session in-memory cache (Phase 1) ---
+// Caches canonical full-session summaries keyed by sessionId.
+// Fingerprint = fileSize:mtimeMs; invalidates when file grows or is modified.
+// In-flight promise dedup prevents thundering herd on concurrent requests.
+const CACHE_TTL_MS = 60_000;
+
+interface SessionCacheEntry {
+  fingerprint: string;
+  summary: SessionCostSummary;
+  cachedAt: number;
+}
+
+const sessionSummaryCache = new Map<string, SessionCacheEntry>();
+const sessionSummaryInFlight = new Map<string, Promise<SessionCostSummary | null>>();
+
+function getSessionCacheFingerprint(stat: fs.Stats): string {
+  return `${stat.size}:${stat.mtimeMs}`;
+}
+
+/** Exported for testing only. */
+export function clearSessionSummaryCache(): void {
+  sessionSummaryCache.clear();
+  sessionSummaryInFlight.clear();
+}
 
 const toFiniteNumber = (value: unknown): number | undefined => {
   if (typeof value !== "number") {
@@ -163,8 +195,12 @@ const parseTranscriptEntry = (entry: Record<string, unknown>): ParsedTranscriptE
   };
 };
 
-const formatDayKey = (date: Date): string =>
-  date.toLocaleDateString("en-CA", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+/**
+ * Format a Date as a UTC day key (YYYY-MM-DD).
+ * Rule: persisted usage buckets are always UTC. User timezone is only applied
+ * when converting filters or display labels (gateway/UI presentation layer).
+ */
+const formatDayKey = (date: Date): string => date.toISOString().slice(0, 10);
 
 const computeLatencyStats = (values: number[]): SessionLatencyStats | undefined => {
   if (!values.length) {
@@ -294,6 +330,11 @@ export async function loadCostUsageSummary(params?: {
   config?: OpenClawConfig;
   agentId?: string;
 }): Promise<CostUsageSummary> {
+  const start = performance.now();
+  let queryPath: QueryPath;
+  let fallbackReason: FallbackReason | undefined;
+  const agentId = params?.agentId;
+
   const now = new Date();
   let sinceTime: number;
   let untilTime: number;
@@ -310,72 +351,115 @@ export async function loadCostUsageSummary(params?: {
     untilTime = now.getTime();
   }
 
-  const dailyMap = new Map<string, CostUsageTotals>();
-  const totals = emptyTotals();
-
-  const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
-  const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
-  const files = (
-    await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-        .map(async (entry) => {
-          const filePath = path.join(sessionsDir, entry.name);
-          const stats = await fs.promises.stat(filePath).catch(() => null);
-          if (!stats) {
-            return null;
-          }
-          // Include file if it was modified after our start time
-          if (stats.mtimeMs < sinceTime) {
-            return null;
-          }
-          return filePath;
-        }),
-    )
-  ).filter((filePath): filePath is string => Boolean(filePath));
-
-  for (const filePath of files) {
-    await scanUsageFile({
-      filePath,
-      config: params?.config,
-      onEntry: (entry) => {
-        const ts = entry.timestamp?.getTime();
-        if (!ts || ts < sinceTime || ts > untilTime) {
-          return;
-        }
-        const dayKey = formatDayKey(entry.timestamp ?? now);
-        const bucket = dailyMap.get(dayKey) ?? emptyTotals();
-        applyUsageTotals(bucket, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(bucket, entry.costBreakdown);
-        } else {
-          applyCostTotal(bucket, entry.costTotal);
-        }
-        dailyMap.set(dayKey, bucket);
-
-        applyUsageTotals(totals, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(totals, entry.costBreakdown);
-        } else {
-          applyCostTotal(totals, entry.costTotal);
-        }
-      },
+  // Phase 3: try persistent aggregate first (O(1) memory read vs O(N) file scan)
+  if (isAnyUsageAggregationReady()) {
+    const aggregated = getAggregatedCostUsage({
+      agentId,
+      startMs: sinceTime,
+      endMs: untilTime,
     });
+    if (aggregated) {
+      queryPath = "aggregate_fast_path";
+      recordUsageQuery({
+        agentId,
+        path: queryPath,
+        latencyMs: performance.now() - start,
+        result: "success",
+      });
+      return aggregated;
+    }
+    // Aggregate was ready but returned null — determine why
+    queryPath = "jsonl_fallback";
+    fallbackReason =
+      agentId && !isUsageAggregationReady(agentId)
+        ? "missing_agent_state"
+        : "aggregate_load_failed";
+  } else {
+    queryPath = "jsonl_fallback";
+    fallbackReason = "aggregate_not_ready";
   }
 
-  const daily = Array.from(dailyMap.entries())
-    .map(([date, bucket]) => Object.assign({ date }, bucket))
-    .toSorted((a, b) => a.date.localeCompare(b.date));
+  // JSONL fallback scan
+  let queryResult: "success" | "error" = "success";
+  try {
+    const dailyMap = new Map<string, CostUsageTotals>();
+    const totals = emptyTotals();
 
-  // Calculate days for backwards compatibility in response
-  const days = Math.ceil((untilTime - sinceTime) / (24 * 60 * 60 * 1000)) + 1;
+    const sessionsDir = resolveSessionTranscriptsDirForAgent(agentId);
+    const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+    const files = (
+      await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+          .map(async (entry) => {
+            const filePath = path.join(sessionsDir, entry.name);
+            const stats = await fs.promises.stat(filePath).catch(() => null);
+            if (!stats) {
+              return null;
+            }
+            // Include file if it was modified after our start time
+            if (stats.mtimeMs < sinceTime) {
+              return null;
+            }
+            return filePath;
+          }),
+      )
+    ).filter((filePath): filePath is string => Boolean(filePath));
 
-  return {
-    updatedAt: Date.now(),
-    days,
-    daily,
-    totals,
-  };
+    for (const filePath of files) {
+      await scanUsageFile({
+        filePath,
+        config: params?.config,
+        onEntry: (entry) => {
+          const ts = entry.timestamp?.getTime();
+          if (!ts || ts < sinceTime || ts > untilTime) {
+            return;
+          }
+          const dayKey = formatDayKey(entry.timestamp ?? now);
+          const bucket = dailyMap.get(dayKey) ?? emptyTotals();
+          applyUsageTotals(bucket, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(bucket, entry.costBreakdown);
+          } else {
+            applyCostTotal(bucket, entry.costTotal);
+          }
+          dailyMap.set(dayKey, bucket);
+
+          applyUsageTotals(totals, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(totals, entry.costBreakdown);
+          } else {
+            applyCostTotal(totals, entry.costTotal);
+          }
+        },
+      });
+    }
+
+    const daily = Array.from(dailyMap.entries())
+      .map(([date, bucket]) => Object.assign({ date }, bucket))
+      .toSorted((a, b) => a.date.localeCompare(b.date));
+
+    // Calculate days for backwards compatibility in response
+    const days = Math.ceil((untilTime - sinceTime) / (24 * 60 * 60 * 1000)) + 1;
+
+    return {
+      updatedAt: Date.now(),
+      days,
+      daily,
+      totals,
+    };
+  } catch (err) {
+    queryResult = "error";
+    throw err;
+  } finally {
+    recordUsageQuery({
+      agentId,
+      path: queryPath,
+      latencyMs: performance.now() - start,
+      result: queryResult,
+      fallbackReason,
+    });
+  }
 }
 
 /**
@@ -479,6 +563,71 @@ export async function loadSessionCostSummary(params: {
     return null;
   }
 
+  // Cache: only for full-session summaries (no date range filter).
+  const isRangeQuery = params.startMs !== undefined || params.endMs !== undefined;
+  const cacheKey = params.sessionId ?? sessionFile;
+
+  if (!isRangeQuery) {
+    // Check in-flight promise first (thundering herd protection)
+    const inFlight = sessionSummaryInFlight.get(cacheKey);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    // Check cache with fingerprint validation
+    try {
+      const stat = fs.statSync(sessionFile);
+      const fingerprint = getSessionCacheFingerprint(stat);
+      const cached = sessionSummaryCache.get(cacheKey);
+      if (
+        cached &&
+        cached.fingerprint === fingerprint &&
+        Date.now() - cached.cachedAt < CACHE_TTL_MS
+      ) {
+        return cached.summary;
+      }
+    } catch {
+      // stat failed — file may have been deleted; proceed to parse (which will handle it)
+    }
+
+    // Wrap the computation in a promise for dedup
+    const promise = loadSessionCostSummaryUncached(sessionFile, params)
+      .then((result) => {
+        sessionSummaryInFlight.delete(cacheKey);
+        if (result) {
+          try {
+            const stat = fs.statSync(sessionFile);
+            sessionSummaryCache.set(cacheKey, {
+              fingerprint: getSessionCacheFingerprint(stat),
+              summary: result,
+              cachedAt: Date.now(),
+            });
+          } catch {
+            // stat failed after parse — cache won't be populated, that's fine
+          }
+        }
+        return result;
+      })
+      .catch((err) => {
+        sessionSummaryInFlight.delete(cacheKey);
+        throw err;
+      });
+    sessionSummaryInFlight.set(cacheKey, promise);
+    return promise;
+  }
+
+  return loadSessionCostSummaryUncached(sessionFile, params);
+}
+
+async function loadSessionCostSummaryUncached(
+  sessionFile: string,
+  params: {
+    sessionId?: string;
+    config?: OpenClawConfig;
+    startMs?: number;
+    endMs?: number;
+  },
+): Promise<SessionCostSummary | null> {
   const totals = emptyTotals();
   let firstActivity: number | undefined;
   let lastActivity: number | undefined;
